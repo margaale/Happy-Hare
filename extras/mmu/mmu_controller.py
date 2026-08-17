@@ -670,6 +670,7 @@ class MmuController(MmuFilamentMovement):
             'spoolman_support': self.p.spoolman_support,
             'bowden_progress': self._get_bowden_progress(), # Simple 0-100%. -1 if not performing bowden move
             'print_start_detection': self.p.print_start_detection, # For Klippain. Not really sure it is necessary
+            'encoder': None,
 
             # DEPRECATED but possibly still used in UI's or by users custom macros
             'espooler_active': self.espooler().get_operation(self.gate_selected)[0] if self.has_espooler() else ESPOOLER_NONE, # DEPRECATED
@@ -682,6 +683,10 @@ class MmuController(MmuFilamentMovement):
             'clog_detection_enabled': False,   # DEPRECATED
         }
 
+        # Keep these fields present from the first status query so Moonraker can
+        # establish stable subscriptions before MMU initialization completes.
+        status.update(self.mmu_unit().sync_feedback.get_status(eventtime))
+
         if not self._ready:
             return status
 
@@ -691,8 +696,8 @@ class MmuController(MmuFilamentMovement):
         # Adds extruder status (like filament remaining)
         status.update(self.mmu_unit().extruder_wrapper.get_status(eventtime))
 
-        # Adds sync_feedback status (this includes flowguard status)
-        status.update(self.mmu_unit().sync_feedback.get_status(eventtime))
+        # Add selector status for the active unit
+        status['selector'] = self.selector().get_status(eventtime)
 
         # Add in active sensors
         status['sensors'] = self.sensor_manager.get_status(eventtime)
@@ -1251,7 +1256,7 @@ class MmuController(MmuFilamentMovement):
         elif gate_status == GATE_EMPTY:
             return "-" if show_letter or show_swatch else UI_SEPARATOR
 
-        return "?" if show_letter or show_swatch else UI_SEPARATOR
+        return "?" if show_letter or show_swatch else swatch
 
 
     def _mmu_visual_to_string(self):
@@ -1310,10 +1315,10 @@ class MmuController(MmuFilamentMovement):
                 if g == self.gate_selected:
                     if g == TOOL_GATE_BYPASS:
                         ext_swatch = bypass_ext_swatch
-                    elif self.filament_pos < FILAMENT_POS_START_BOWDEN:
-                        ext_swatch = UI_SEPARATOR
+                    elif self.gate_status[g] != GATE_EMPTY:
+                        ext_swatch = self._get_filament_char(g, symbol=UI_SOLID_TRIANGLE)
                     else:
-                        ext_swatch = self._get_filament_char(g, show_swatch=True, symbol=UI_SOLID_TRIANGLE)
+                        ext_swatch = UI_SEPARATOR
                     select_strings.append(f"|\\{ext_swatch}/|")
                 else:
                     select_strings.append(selct_char * 4)
