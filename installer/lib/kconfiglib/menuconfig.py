@@ -217,7 +217,7 @@ import textwrap
 
 # Happy Hare: Added FLOAT
 from kconfiglib import Symbol, Choice, MENU, COMMENT, MenuNode, \
-                       BOOL, TRISTATE, STRING, FLOAT, INT, HEX, \
+                       BOOL, BOOLINT, TRISTATE, STRING, FLOAT, INT, HEX, \
                        AND, OR, \
                        expr_str, expr_value, split_expr, \
                        standard_sc_expr_str, \
@@ -248,7 +248,8 @@ _SUBMENU_INDENT = 4
 _PG_JUMP = 6
 
 # Height of the help window in show-help mode
-_SHOW_HELP_HEIGHT = 8
+_SHOW_HELP_HEIGHT = 7
+_ALWAYS_SHOW_HELP_WINDOW = True
 
 # How far the cursor needs to be from the edge of the window before it starts
 # to scroll. Used for the main menu display, the information display, the
@@ -269,8 +270,7 @@ _N_SCROLL_ARROWS = 14
 #"""[1:-1].split("\n")
 # Happy Hare: Remove show-help text...
 _MAIN_HELP_LINES = """
-+[Space/Enter] Toggle/enter      [R] Reset parameter to default
-+[Q] Quit (prompts for save)     [ESC] Leave menu
+ [Space/Enter] Toggle/enter  [R] Reset parameter to default  [Q] Quit (prompts for save)  [ESC] Leave menu
 """[1:-1].split("\n")
 
 # Lines of help text shown at the bottom of the information dialog
@@ -695,12 +695,13 @@ def menuconfig(kconf):
     # Filename to save minimal configuration to
     _minconf_filename = "defconfig"
 
-    # Any visible items in the top menu?
+    # Any selectable items in the top menu? Comments are displayed, but the
+    # cursor never lands on them.
     _show_all = False
-    if not _shown_nodes(kconf.top_node):
+    if _first_selectable_index(_shown_nodes(kconf.top_node)) is None:
         # Nothing visible. Start in show-all mode and try again.
         _show_all = True
-        if not _shown_nodes(kconf.top_node):
+        if _first_selectable_index(_shown_nodes(kconf.top_node)) is None:
             # Give up. The implementation relies on always having a selected
             # node.
             print("Empty configuration -- nothing to configure.\n"
@@ -769,7 +770,7 @@ def _needs_save():
             if sym.config_string and not sym._was_default:
                 # Unwritten symbol
                 return True
-        elif sym.orig_type in (BOOL, TRISTATE):
+        elif sym.orig_type in (BOOL, BOOLINT, TRISTATE):
             if sym.tri_value != sym.user_value and not sym._was_default:
                 # Written bool/tristate symbol, new value
                 return True
@@ -922,7 +923,7 @@ def _menuconfig(stdscr):
             # dialog was open
             _resize_main()
 
-        elif c == "?":
+        elif False and c == "?": # Happy Hare: Disable
             _info_dialog(_shown[_sel_node_i], False)
             # The terminal might have been resized while the fullscreen info
             # dialog was open
@@ -1048,7 +1049,8 @@ def _init():
 
     _cur_menu = _kconf.top_node
     _shown = _shown_nodes(_cur_menu)
-    _sel_node_i = _menu_scroll = 0
+    _sel_node_i = _first_selectable_index(_shown)
+    _menu_scroll = 0
 
     _show_help = True
     _show_name = False
@@ -1069,7 +1071,8 @@ def _resize_main():
     _top_sep_win.resize(1, screen_width)
     _bot_sep_win.resize(1, screen_width)
 
-    help_win_height = (_SHOW_HELP_HEIGHT if _show_help and _node_has_help() else 0) + len(_MAIN_HELP_LINES)
+    show_item_help = _ALWAYS_SHOW_HELP_WINDOW or (_show_help and _node_has_help())
+    help_win_height = (_SHOW_HELP_HEIGHT if show_item_help else 0) + len(_MAIN_HELP_LINES)
 
     menu_win_height = screen_height - help_win_height - 3
 
@@ -1125,9 +1128,17 @@ def _enter_menu(menu):
     if not menu.is_menuconfig:
         return False  # Not a menu
 
+    # Happy Hare: A force-shown menu whose dependencies are not met is a
+    # disabled placeholder. Keep it visible for context/help, but do not allow
+    # navigation into its inactive children.
+    if _forced_disabled_menu(menu):
+        return False
+
     shown_sub = _shown_nodes(menu)
-    # Never enter empty menus. We depend on having a current node.
-    if not shown_sub:
+    first_selectable = _first_selectable_index(shown_sub)
+    # Never enter menus that contain no selectable entries. Comments can make
+    # a menu non-empty while still leaving nowhere valid for the cursor.
+    if first_selectable is None:
         return False
 
     # Remember where the current node appears on the screen, so we can try
@@ -1137,7 +1148,8 @@ def _enter_menu(menu):
     # Jump into menu
     _cur_menu = menu
     _shown = shown_sub
-    _sel_node_i = _menu_scroll = 0
+    _sel_node_i = first_selectable
+    _menu_scroll = 0
 
     if isinstance(menu.item, Choice):
         _select_selected_choice_sym()
@@ -1243,6 +1255,21 @@ def _leave_menu():
         _center_vertically()
 
 
+def _first_selectable_index(nodes):
+    # Comments provide structure and explanation, but are not interactive menu
+    # entries. Return None when a list contains comments only.
+    return _next_selectable_index(nodes, -1, 1)
+
+
+def _next_selectable_index(nodes, start, step):
+    i = start + step
+    while 0 <= i < len(nodes):
+        if nodes[i].item != COMMENT:
+            return i
+        i += step
+    return None
+
+
 def _select_next_menu_entry():
     # Selects the menu entry after the current one, adjusting the scroll if
     # necessary. Does nothing if we're already at the last menu entry.
@@ -1250,18 +1277,19 @@ def _select_next_menu_entry():
     global _sel_node_i
     global _menu_scroll
 
-    if _sel_node_i < len(_shown) - 1:
-        # Jump to the next node
-        _sel_node_i += 1
+    next_i = _next_selectable_index(_shown, _sel_node_i, 1)
+    if next_i is not None:
+        old_i = _sel_node_i
+        _sel_node_i = next_i
 
         # If the new node is sufficiently close to the edge of the menu window
         # (as determined by _SCROLL_OFFSET), increase the scroll by one. This
         # gives nice and non-jumpy behavior even when
         # _SCROLL_OFFSET >= _height(_menu_win).
-        if _sel_node_i >= _menu_scroll + _height(_menu_win) - _SCROLL_OFFSET \
-           and _menu_scroll < _max_scroll(_shown, _menu_win):
-
-            _menu_scroll += 1
+        for node_i in range(old_i + 1, _sel_node_i + 1):
+            if node_i >= _menu_scroll + _height(_menu_win) - _SCROLL_OFFSET \
+               and _menu_scroll < _max_scroll(_shown, _menu_win):
+                _menu_scroll += 1
 
 
 def _select_prev_menu_entry():
@@ -1271,13 +1299,15 @@ def _select_prev_menu_entry():
     global _sel_node_i
     global _menu_scroll
 
-    if _sel_node_i > 0:
-        # Jump to the previous node
-        _sel_node_i -= 1
+    prev_i = _next_selectable_index(_shown, _sel_node_i, -1)
+    if prev_i is not None:
+        old_i = _sel_node_i
+        _sel_node_i = prev_i
 
         # See _select_next_menu_entry()
-        if _sel_node_i < _menu_scroll + _SCROLL_OFFSET:
-            _menu_scroll = max(_menu_scroll - 1, 0)
+        for node_i in range(old_i - 1, _sel_node_i - 1, -1):
+            if node_i < _menu_scroll + _SCROLL_OFFSET:
+                _menu_scroll = max(_menu_scroll - 1, 0)
 
 
 def _select_last_menu_entry():
@@ -1286,7 +1316,7 @@ def _select_last_menu_entry():
     global _sel_node_i
     global _menu_scroll
 
-    _sel_node_i = len(_shown) - 1
+    _sel_node_i = _next_selectable_index(_shown, len(_shown), -1)
     _menu_scroll = _max_scroll(_shown, _menu_win)
 
 
@@ -1296,7 +1326,8 @@ def _select_first_menu_entry():
     global _sel_node_i
     global _menu_scroll
 
-    _sel_node_i = _menu_scroll = 0
+    _sel_node_i = _first_selectable_index(_shown)
+    _menu_scroll = 0
 
 
 def _toggle_show_all():
@@ -1421,6 +1452,15 @@ def _draw_main():
     if _menu_scroll < _max_scroll(_shown, _menu_win):
         _safe_hline(_bot_sep_win, 0, 4, curses.ACS_DARROW, _N_SCROLL_ARROWS)
 
+    # Happy Hare: Label the separator above the help pane
+    help_label = " Help "
+    _safe_addstr(
+        _bot_sep_win,
+        0,
+        max((term_width - len(help_label)) // 2, 0),
+        help_label,
+    )
+
     # Indicate when show-name/show-help/show-all mode is enabled
     enabled_modes = []
     # Happy Hare: Always show the help lines
@@ -1438,15 +1478,17 @@ def _draw_main():
     # Update the help window, which shows either key bindings or help texts
     #
 
-    if _show_help and _node_has_help():  # Happy Hare: Added
+    show_item_help = _ALWAYS_SHOW_HELP_WINDOW or (_show_help and _node_has_help())
+    if show_item_help:  # Happy Hare: Added
         _set_style(_help_win, "show-help")
         _resize_main()
         _help_win.erase()
 
         node = _shown[_sel_node_i]
-        help_lines = node.help.split("\n")  # Happy Hare: Retain line formatting
-        for i in range(min(_height(_help_win), len(help_lines))):
-            _safe_addstr(_help_win, i, 0, help_lines[i])
+        help_text = getattr(node, "help", None)
+        help_lines = help_text.split("\n") if help_text else []  # Happy Hare: Retain line formatting
+        for i in range(min(_SHOW_HELP_HEIGHT, len(help_lines))):
+            _safe_addstr(_help_win, i, 1, help_lines[i])
 
         # Happy Hare: Reset the background of the main help lines
         _set_style(_help_win, "help")
@@ -1459,7 +1501,7 @@ def _draw_main():
 
     # Happy Hare: Always show the main help lines
     for i, line in enumerate(_MAIN_HELP_LINES):
-        _safe_addstr(_help_win, (_SHOW_HELP_HEIGHT if _show_help and _node_has_help() else 0) + i, 0, line)
+        _safe_addstr(_help_win, (_SHOW_HELP_HEIGHT if show_item_help else 0) + i, 0, line)
 
     _bot_sep_win.noutrefresh()
     _help_win.noutrefresh()
@@ -1593,18 +1635,37 @@ def _shown_nodes(menu):
 
 def _node_has_help():
     node = _shown[_sel_node_i]
-    return (isinstance(node.item, (Symbol, Choice)) or node.item == MENU) and node.help
+    return (isinstance(node.item, (Symbol, Choice)) or node.item == MENU) and \
+        getattr(node, "help", None)
+
+
+def _normally_visible(node):
+    # Returns True when the node is visible according to standard Kconfig
+    # prompt and menu visibility rules.
+    return bool(
+        node.prompt and
+        expr_value(node.prompt[1]) and
+        not (node.item == MENU and not expr_value(node.visibility))
+    )
+
+
+def _forced_disabled_menu(node):
+    # A force-shown menu remains listed when inactive, but acts as a disabled
+    # placeholder rather than an enterable submenu.
+    return (
+        node.item == MENU and
+        hasattr(node, "forceshow") and
+        not _normally_visible(node)
+    )
 
 
 def _visible(node):
     # Returns True if the node should appear in the menu (outside show-all
-    # mode)
-
-    # Happy Hare: Add (and impl) "or node.forceshow" to be able to force showing
-    return node.prompt and (expr_value(node.prompt[1]) or hasattr(node, 'forceshow')) and not \
-        (node.item == MENU and not expr_value(node.visibility))
-#    return node.prompt and expr_value(node.prompt[1]) and not \
-#        (node.item == MENU and not expr_value(node.visibility))
+    # mode). Happy Hare: forceshow can make inactive symbols and menus visible.
+    return bool(
+        node.prompt and
+        (_normally_visible(node) or hasattr(node, "forceshow"))
+    )
 
 
 def _reset_node(node): # Happy Hare: Added method
@@ -1666,8 +1727,8 @@ def _value_repr(item): # Happy Hare: Added method
     if isinstance(item, Choice):
         sel = item.selection
         return sel.name if sel is not None else "(none)"
-    if item.type in (BOOL, TRISTATE):
-        return item.str_value # "n"/"m"/"y"
+    if item.type in (BOOL, BOOLINT, TRISTATE):
+        return item.str_value # "n"/"m"/"y" or BOOLINT "0"/"1"
     return item.str_value     # strings/ints/hex already as text
     
 
@@ -1698,7 +1759,7 @@ def differs_from_default(node, sc, reset=True): # Happy Hare: Added method
 
         # Restore the choice's own mode first
         if saved_choice_uv is not None:
-            if sc.type in (BOOL, TRISTATE):
+            if sc.type in (BOOL, BOOLINT, TRISTATE):
                 sc.set_value(("n", "m", "y")[saved_choice_uv])
             else:
                 sc.set_value(saved_choice_uv)
@@ -1712,7 +1773,7 @@ def differs_from_default(node, sc, reset=True): # Happy Hare: Added method
             if m is saved_user_sel:
                 continue
 
-            if m.type in (BOOL, TRISTATE):
+            if m.type in (BOOL, BOOLINT, TRISTATE):
 
                 # Skip restoring alternate selected members
                 if uv == 2:   # y
@@ -1742,7 +1803,7 @@ def differs_from_default(node, sc, reset=True): # Happy Hare: Added method
 
         # Restore
         if saved_uv is not None:
-            if sc.type in (BOOL, TRISTATE):
+            if sc.type in (BOOL, BOOLINT, TRISTATE):
                 sc.set_value(("n","m","y")[saved_uv])
             else:
                 sc.set_value(saved_uv)
@@ -3452,11 +3513,17 @@ def _node_str(node):
             s += " [[DIM]](NOT DEFAULT)[[/DIM]]"
 
     # Print "--->" next to nodes that have menus that can potentially be
-    # entered. Print "----" if the menu is empty. We don't allow those to be
-    # entered.
+    # entered. Force-shown inactive menus retain the arrow for context, carry
+    # a disabled label, and render the entire row dimmed.
+    disabled_menu = _forced_disabled_menu(node)
     if node.is_menuconfig:
-        # Happy Hare s += "  --->" if _shown_nodes(node) else "  ----"
-        s += "  --->" if _shown_nodes(node) else ""
+        if disabled_menu:
+            s += "  --- [DISABLED]"
+        elif _shown_nodes(node):
+            s += "  --->"
+
+    if disabled_menu:
+        s = "[[DIM]]{}[[/DIM]]".format(s)
 
     return s
 
@@ -3490,7 +3557,7 @@ def _value_str(node):
             return "([[B]]{}[[/B]])".format(item.str_value)
             #return "({})".format(item.str_value)
 
-    # BOOL or TRISTATE
+    # BOOL, BOOLINT, or TRISTATE
 
     if _is_y_mode_choice_sym(item):
         return "(X)" if item.choice.selection is item else "( )"
@@ -3501,7 +3568,7 @@ def _value_str(node):
         # Pinned to a single value
         return "" if isinstance(item, Choice) else "-{}-".format(tri_val_str)
 
-    if item.type == BOOL:
+    if item.type in (BOOL, BOOLINT):
         return "[{}]".format(tri_val_str)
 
     # item.type == TRISTATE
